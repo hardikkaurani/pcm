@@ -3766,8 +3766,16 @@ public:
     HTTPServer( HTTPServer const & ) = delete;
     HTTPServer & operator = ( HTTPServer const & ) = delete;
 
+    bool isStopped() const {
+        return stopped_.load();
+    }
+
+    double getInterval() const {
+        return interval_;
+    }
+
     virtual ~HTTPServer() {
-        if ( ! stopped_ ) {
+        if ( ! stopped_.load() ) {
             DBG( 0, "BUG: HTTPServer or derived class not explicitly stopped before destruction!" );
             stop();
         }
@@ -3780,7 +3788,7 @@ public:
     void stop() {
         {
             std::lock_guard<std::mutex> lock( agVectorMutex_ );
-            stopped_ = true;
+            stopped_.store( true );
         }
         agVectorCV_.notify_all();
         if ( serverSocket_ != INVALID_SOCKET ) {
@@ -3853,11 +3861,15 @@ public:
 
         const double targetSeconds = static_cast<double>(seconds);
 
+        if ( targetSeconds < interval_ ) {
+            throw std::invalid_argument( "Requested duration (" + std::to_string( seconds ) + "s) cannot be represented by the configured sampling interval (" + std::to_string( interval_ ) + "s)" );
+        }
+
         // Wait under the mutex until we have enough samples to return, using the
         // condition variable so we don't race against addAggregator().
         std::unique_lock<std::mutex> lock( agVectorMutex_ );
         agVectorCV_.wait( lock, [&]{
-            if ( stopped_ ) {
+            if ( stopped_.load() ) {
                 return true;
             }
             if ( recentQueue_.size() <= index2 ) {
@@ -3871,10 +3883,10 @@ public:
             const auto span = std::chrono::duration<double>( refTime - oldestTime ).count();
             const bool historyFull = ( !coarseQueue_.empty() && coarseQueue_.size() >= maxCoarseSamples_ ) ||
                                      ( coarseQueue_.empty() && recentQueue_.size() >= maxRecentSamples_ );
-            return span >= ( targetSeconds - interval_ * 0.5 ) || historyFull;
+            return span >= ( targetSeconds - (std::min)( 0.5, interval_ * 0.5 ) ) || historyFull;
         } );
 
-        if ( stopped_ ) {
+        if ( stopped_.load() ) {
             if ( recentQueue_.size() <= index2 ) {
                 throw std::runtime_error( "Server stopped before enough samples were collected." );
             }
@@ -3913,8 +3925,8 @@ public:
             }
         }
 
-        if ( !bestAgp ) {
-            throw std::runtime_error( "Failed to find matching aggregator for history selection." );
+        if ( !bestAgp || bestDiff > (std::max)( 0.5, interval_ * 0.75 ) ) {
+            throw std::runtime_error( "Failed to find matching aggregator for requested duration." );
         }
 
         auto ret = std::make_pair( bestAgp, recentQueue_[ index2 ].agp );
@@ -3984,7 +3996,7 @@ protected:
     std::condition_variable agVectorCV_;
     PeriodicCounterFetcher* pcf_;
     std::shared_ptr<PeriodicCounterFetcher::SharedState> pcfState_;
-    bool stopped_;
+    std::atomic<bool> stopped_;
     double interval_;
     double coarseResolution_;
 };
@@ -4013,11 +4025,6 @@ BOOL WINAPI SignalHandler::handleSignal( DWORD signum )
 void SignalHandler::handleSignal( int signum )
 {
     signalCaught_ = signum;
-    // Async-signal-safe notification: close socket to unblock accept() in normal execution context
-    if ( networkSocket_ != INVALID_SOCKET ) {
-        ::close( networkSocket_ );
-        networkSocket_ = INVALID_SOCKET;
-    }
 }
 #endif
 
@@ -4069,7 +4076,7 @@ void HTTPServer::run() {
     struct sockaddr_in clientAddress;
     clientAddress.sin_family = AF_INET;
     socket_t clientSocketFD = INVALID_SOCKET;
-    while ( ! stopped_ ) {
+    while ( ! stopped_.load() ) {
 #ifndef _WIN32
         if ( SignalHandler::wasSignaled() ) {
             break;
@@ -4143,7 +4150,7 @@ void HTTPServer::run() {
             continue;
         }
 
-        if ( stopped_ ) {
+        if ( stopped_.load() ) {
             // Overkill if you know the program flow but we want to be overly cautious...
             deleteAndNullify( connection );
             break;
@@ -4171,7 +4178,7 @@ public:
     HTTPSServer( HTTPSServer const & ) = delete;
     HTTPSServer & operator = ( HTTPSServer const & ) = delete;
     virtual ~HTTPSServer() {
-        if ( ! stopped_ ) {
+        if ( ! stopped_.load() ) {
             DBG( 0, "BUG: HTTPServer or derived class not explicitly stopped before destruction!" );
             stop();
         }
@@ -4231,7 +4238,7 @@ void HTTPSServer::run() {
     if ( nullptr == sslCTX_ )
         throw std::runtime_error( "No SSL_CTX created" );
 
-    while ( ! stopped_ ) {
+    while ( ! stopped_.load() ) {
 #ifndef _WIN32
         if ( SignalHandler::wasSignaled() ) {
             break;
@@ -4365,7 +4372,7 @@ void HTTPSServer::run() {
         HTTPConnection* connection = new HTTPConnection( this, clientSocketFD, clientAddress, callbackList_, ssl );
         ssl = nullptr;
 
-        if ( stopped_ ) {
+        if ( stopped_.load() ) {
             // Overkill if you know the program flow but we want to be overly cautious...
             deleteAndNullify( connection );
             break;
@@ -4552,7 +4559,19 @@ void my_get_callback( HTTPServer* hs, HTTPRequest const & req, HTTPResponse & re
         if ( 10 == url.path_.size() || ( 11 == url.path_.size() && url.path_.at(10) == '/' ) ) {
             DBG( 3, "size == 10 or 11" );
             // path looks like /persecond or /persecond/
-            aggregatorPair = hs->getAggregators( 1, 0 );
+            try {
+                aggregatorPair = hs->getAggregators( 1, 0 );
+            } catch ( const std::invalid_argument& e ) {
+                DBG( 3, "Invalid duration requested for configured interval: ", e.what() );
+                std::string body( std::string( "400 Bad Request. " ) + e.what() );
+                resp.createResponse( TextPlain, body, RC_400_BadRequest );
+                return;
+            } catch ( const std::runtime_error& e ) {
+                DBG( 3, "Runtime error in getAggregators: ", e.what() );
+                std::string body( std::string( "503 Service Unavailable. " ) + e.what() );
+                resp.createResponse( TextPlain, body, RC_503_ServiceUnavailable );
+                return;
+            }
         } else {
             DBG( 3, "size > 11: size = ", url.path_.size() );
             // We're looking for value X after /persecond/X and possibly a trailing / anything else not
@@ -4572,7 +4591,19 @@ void my_get_callback( HTTPServer* hs, HTTPRequest const & req, HTTPResponse & re
                         seconds = 0;
                     }
                     if ( 1 <= seconds && HTTPServer::maxPerSecondSeconds_ >= seconds ) {
-                        aggregatorPair = hs->getAggregators( seconds, 0 );
+                        try {
+                            aggregatorPair = hs->getAggregators( seconds, 0 );
+                        } catch ( const std::invalid_argument& e ) {
+                            DBG( 3, "Invalid duration requested for configured interval: ", e.what() );
+                            std::string body( std::string( "400 Bad Request. " ) + e.what() );
+                            resp.createResponse( TextPlain, body, RC_400_BadRequest );
+                            return;
+                        } catch ( const std::runtime_error& e ) {
+                            DBG( 3, "Runtime error in getAggregators: ", e.what() );
+                            std::string body( std::string( "503 Service Unavailable. " ) + e.what() );
+                            resp.createResponse( TextPlain, body, RC_503_ServiceUnavailable );
+                            return;
+                        }
                     } else {
                         DBG( 3, "seconds equals 0 or seconds larger than ", HTTPServer::maxPerSecondSeconds_, " is not allowed" );
                         std::string body( "400 Bad Request. seconds equals 0 or seconds larger than " + std::to_string( HTTPServer::maxPerSecondSeconds_ ) + " is not allowed" );

@@ -254,3 +254,84 @@ TEST(PcmSensorServerHistoryTest, NearestSampleSelectionAccuracy) {
     EXPECT_EQ( pair.second, agpC );
     EXPECT_EQ( pair.first, agpB );
 }
+
+
+// TEST 7 - INCOMPATIBLE INTERVAL REJECTION
+// Verify that requests for durations shorter than the configured collection interval
+// are rejected with std::invalid_argument instead of returning a misleading duration.
+TEST(PcmSensorServerHistoryTest, IncompatibleIntervalRejectsSubIntervalDuration) {
+    // Case A: 3600-second interval rejects 1-second and 10-second requests
+    {
+        HTTPServer server( 3600.0, false, false );
+        EXPECT_THROW( server.getAggregators( 1, 0 ), std::invalid_argument );
+        EXPECT_THROW( server.getAggregators( 10, 0 ), std::invalid_argument );
+    }
+
+    // Case B: 2.0-second interval rejects 1-second request, but accepts 2-second request
+    {
+        HTTPServer server( 2.0, false, false );
+        EXPECT_THROW( server.getAggregators( 1, 0 ), std::invalid_argument );
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto agp1 = makeDummyAggregator();
+        auto agp2 = makeDummyAggregator();
+        server.addAggregator( agp1, t0 );
+        server.addAggregator( agp2, t0 + std::chrono::seconds( 2 ) );
+
+        auto pair = server.getAggregators( 2, 0 );
+        EXPECT_EQ( pair.second, agp2 );
+        EXPECT_EQ( pair.first, agp1 );
+    }
+}
+
+// TEST 8 - MISMATCHED HISTORY ERROR BOUND
+// Verify that if history has a huge gap and no sample is within acceptable tolerance,
+// getAggregators throws std::runtime_error rather than returning a grossly mismatched snapshot.
+TEST(PcmSensorServerHistoryTest, MismatchedHistoryThrowsWhenNoSampleMatchesDuration) {
+    const double interval = 1.0;
+    HTTPServer server( interval, false, false );
+    const auto t0 = std::chrono::steady_clock::now();
+
+    auto agpA = makeDummyAggregator();
+    auto agpB = makeDummyAggregator();
+
+    // Two samples 20 seconds apart
+    server.addAggregator( agpA, t0 );
+    server.addAggregator( agpB, t0 + std::chrono::seconds( 20 ) );
+
+    // Requesting 5 seconds: neither agpA (20s ago, diff 15s) nor agpB (0s ago, diff 5s)
+    // is within the acceptable tolerance for a 5-second window.
+    EXPECT_THROW( server.getAggregators( 5, 0 ), std::runtime_error );
+}
+
+// TEST 9 - THREAD SAFETY OF ATOMIC STOPPED
+// Verify that stopped_ flag is atomic, isStopped() reflects stop(), and concurrent reads are race-free.
+TEST(PcmSensorServerHistoryTest, AtomicStoppedThreadSafety) {
+    HTTPServer server( 1.0, false, false );
+    EXPECT_FALSE( server.isStopped() );
+
+    std::atomic<bool> startReading( false );
+    std::atomic<bool> stopReading( false );
+    std::vector<std::thread> readers;
+
+    for ( int i = 0; i < 4; ++i ) {
+        readers.emplace_back( [&]() {
+            while ( !startReading.load() ) {
+                std::this_thread::yield();
+            }
+            while ( !stopReading.load() ) {
+                (void)server.isStopped();
+            }
+        } );
+    }
+
+    startReading = true;
+    std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+    server.stop();
+    EXPECT_TRUE( server.isStopped() );
+
+    stopReading = true;
+    for ( auto& t : readers ) {
+        t.join();
+    }
+}
