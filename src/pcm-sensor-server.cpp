@@ -3786,29 +3786,31 @@ public:
     virtual void run() override;
 
     void stop() {
-        {
-            std::lock_guard<std::mutex> lock( agVectorMutex_ );
-            stopped_.store( true );
-        }
-        agVectorCV_.notify_all();
-        if ( serverSocket_ != INVALID_SOCKET ) {
+        std::call_once( stopOnceFlag_, [this]() {
+            {
+                std::lock_guard<std::mutex> lock( agVectorMutex_ );
+                stopped_.store( true );
+            }
+            agVectorCV_.notify_all();
+            if ( serverSocket_ != INVALID_SOCKET ) {
 #ifdef _WIN32
-            closesocket( serverSocket_ );
+                closesocket( serverSocket_ );
 #else
-            ::close( serverSocket_ );
+                ::close( serverSocket_ );
 #endif
-            serverSocket_ = INVALID_SOCKET;
-        }
-        if ( pcf_ ) {
-            pcf_->stop();
-            pcf_ = nullptr;
-        }
-        if ( pcfState_ ) {
-            std::unique_lock<std::mutex> lock( pcfState_->mtx );
-            pcfState_->doneCv.wait( lock, [this]() { return pcfState_->done.load(); } );
-            pcfState_ = nullptr;
-        }
-        ThreadPool::getInstance().emptyThreadPool();
+                serverSocket_ = INVALID_SOCKET;
+            }
+            if ( pcf_ ) {
+                pcf_->stop();
+                pcf_ = nullptr;
+            }
+            if ( pcfState_ ) {
+                std::unique_lock<std::mutex> lock( pcfState_->mtx );
+                pcfState_->doneCv.wait( lock, [this]() { return pcfState_->done.load(); } );
+                pcfState_ = nullptr;
+            }
+            ThreadPool::getInstance().emptyThreadPool();
+        } );
     }
 
     // Register Callbacks
@@ -3997,6 +3999,7 @@ protected:
     PeriodicCounterFetcher* pcf_;
     std::shared_ptr<PeriodicCounterFetcher::SharedState> pcfState_;
     std::atomic<bool> stopped_;
+    std::once_flag stopOnceFlag_;
     double interval_;
     double coarseResolution_;
 };

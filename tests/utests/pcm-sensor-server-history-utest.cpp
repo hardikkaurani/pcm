@@ -335,3 +335,35 @@ TEST(PcmSensorServerHistoryTest, AtomicStoppedThreadSafety) {
         t.join();
     }
 }
+
+
+// TEST 10 - CONCURRENT STOP IDEMPOTENCY
+// Verify that calling stop() concurrently from multiple threads is serialized,
+// idempotent, and free from double-close or null-dereference races.
+TEST(PcmSensorServerHistoryTest, ConcurrentStopIsIdempotentAndThreadSafe) {
+    HTTPServer server( 1.0, false, false );
+    EXPECT_FALSE( server.isStopped() );
+
+    std::atomic<bool> startStopping( false );
+    std::vector<std::thread> threads;
+
+    for ( int i = 0; i < 8; ++i ) {
+        threads.emplace_back( [&]() {
+            while ( !startStopping.load() ) {
+                std::this_thread::yield();
+            }
+            server.stop();
+            EXPECT_TRUE( server.isStopped() );
+        } );
+    }
+
+    startStopping = true;
+    for ( auto& t : threads ) {
+        t.join();
+    }
+
+    EXPECT_TRUE( server.isStopped() );
+    // Sequential call after concurrent stops should also be a safe no-op
+    server.stop();
+    EXPECT_TRUE( server.isStopped() );
+}
