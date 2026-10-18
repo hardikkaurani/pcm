@@ -3809,6 +3809,8 @@ public:
                 pcfState_->doneCv.wait( lock, [this]() { return pcfState_->done.load(); } );
                 pcfState_ = nullptr;
             }
+            // Drain worker threads; emptyThreadPool() safely excludes and detaches
+            // the calling thread if stop() is invoked from a ThreadPool worker context.
             ThreadPool::getInstance().emptyThreadPool();
         } );
     }

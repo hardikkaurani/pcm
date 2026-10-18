@@ -65,8 +65,16 @@ public:
         try {
             for (size_t i = 0; i < threads_.size(); ++i)
                 addWork(nullptr);
-            for (size_t i = 0; i < threads_.size(); ++i)
-                threads_[i].join();
+            const auto currentId = std::this_thread::get_id();
+            for (size_t i = 0; i < threads_.size(); ++i) {
+                if (threads_[i].joinable()) {
+                    if (threads_[i].get_id() == currentId) {
+                        threads_[i].detach();
+                    } else {
+                        threads_[i].join();
+                    }
+                }
+            }
             threads_.clear();
         }
         catch (const std::exception& e)

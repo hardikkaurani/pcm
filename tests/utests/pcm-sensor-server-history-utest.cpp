@@ -367,3 +367,39 @@ TEST(PcmSensorServerHistoryTest, ConcurrentStopIsIdempotentAndThreadSafe) {
     server.stop();
     EXPECT_TRUE( server.isStopped() );
 }
+
+
+// TEST 11 - WORKER THREAD STOP DEADLOCK PREVENTION
+// Verify that invoking stop() from inside a ThreadPool worker thread
+// (such as an HTTP callback or Work item) does not self-join deadlock or throw std::system_error.
+TEST(PcmSensorServerHistoryTest, StopFromWorkerThreadDoesNotSelfJoinDeadlock) {
+    HTTPServer server( 1.0, false, false );
+    EXPECT_FALSE( server.isStopped() );
+
+    class WorkerStopJob : public pcm::Work {
+    public:
+        WorkerStopJob( HTTPServer* s, std::promise<bool>& p ) : server_( s ), promise_( p ) {}
+        virtual void execute() override {
+            try {
+                server_->stop();
+                promise_.set_value( true );
+            } catch ( ... ) {
+                promise_.set_exception( std::current_exception() );
+            }
+        }
+    private:
+        HTTPServer* server_;
+        std::promise<bool>& promise_;
+    };
+
+    std::promise<bool> promise;
+    auto future = promise.get_future();
+
+    pcm::WorkQueue::getInstance()->addWork( new WorkerStopJob( &server, promise ) );
+
+    // Must resolve cleanly without deadlock
+    auto status = future.wait_for( std::chrono::seconds( 5 ) );
+    ASSERT_EQ( status, std::future_status::ready );
+    EXPECT_TRUE( future.get() );
+    EXPECT_TRUE( server.isStopped() );
+}
