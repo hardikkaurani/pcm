@@ -402,4 +402,79 @@ TEST(PcmSensorServerHistoryTest, StopFromWorkerThreadDoesNotSelfJoinDeadlock) {
     ASSERT_EQ( status, std::future_status::ready );
     EXPECT_TRUE( future.get() );
     EXPECT_TRUE( server.isStopped() );
+
+    // Sequential stop call from non-worker control thread is safe and idempotent
+    EXPECT_NO_THROW( server.stop() );
+    EXPECT_TRUE( server.isStopped() );
+}
+
+
+// TEST 12 - CONCURRENT WORKER THREADS STOP DEADLOCK PREVENTION
+// Verify that concurrent stop() calls from multiple ThreadPool worker threads
+// complete without deadlock, cross-worker join cycles, or std::system_error,
+// and that a subsequent sequential stop() call is safe.
+TEST(PcmSensorServerHistoryTest, ConcurrentWorkersStopDoesNotDeadlock) {
+    HTTPServer server( 1.0, false, false );
+    EXPECT_FALSE( server.isStopped() );
+
+    constexpr int kNumWorkers = 4;
+    std::atomic<int> readyCount( 0 );
+    std::atomic<bool> startGate( false );
+
+    class ConcurrentWorkerStopJob : public pcm::Work {
+    public:
+        ConcurrentWorkerStopJob( HTTPServer* s,
+                                 std::atomic<int>& ready,
+                                 std::atomic<bool>& gate,
+                                 std::promise<bool>& p )
+            : server_( s ), ready_( ready ), gate_( gate ), promise_( p ) {}
+
+        virtual void execute() override {
+            try {
+                ready_.fetch_add( 1 );
+                while ( !gate_.load() ) {
+                    std::this_thread::yield();
+                }
+                server_->stop();
+                promise_.set_value( true );
+            } catch ( ... ) {
+                promise_.set_exception( std::current_exception() );
+            }
+        }
+
+    private:
+        HTTPServer* server_;
+        std::atomic<int>& ready_;
+        std::atomic<bool>& gate_;
+        std::promise<bool>& promise_;
+    };
+
+    std::promise<bool> promises[kNumWorkers];
+    std::future<bool> futures[kNumWorkers];
+    for ( int i = 0; i < kNumWorkers; ++i ) {
+        futures[i] = promises[i].get_future();
+        pcm::WorkQueue::getInstance()->addWork(
+            new ConcurrentWorkerStopJob( &server, readyCount, startGate, promises[i] ) );
+    }
+
+    // Wait until all workers are running their jobs inside the thread pool
+    while ( readyCount.load() < kNumWorkers ) {
+        std::this_thread::yield();
+    }
+
+    // Release all workers simultaneously to call stop() concurrently
+    startGate.store( true );
+
+    // Verify all workers complete within 5 seconds without deadlock or std::system_error
+    for ( int i = 0; i < kNumWorkers; ++i ) {
+        auto status = futures[i].wait_for( std::chrono::seconds( 5 ) );
+        ASSERT_EQ( status, std::future_status::ready );
+        EXPECT_TRUE( futures[i].get() );
+    }
+
+    EXPECT_TRUE( server.isStopped() );
+
+    // A later sequential stop() call must be safe and idempotent
+    EXPECT_NO_THROW( server.stop() );
+    EXPECT_TRUE( server.isStopped() );
 }

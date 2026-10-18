@@ -3778,6 +3778,10 @@ public:
         if ( ! stopped_.load() ) {
             DBG( 0, "BUG: HTTPServer or derived class not explicitly stopped before destruction!" );
             stop();
+        } else if ( ! ThreadPool::isCurrentThreadWorker() ) {
+            std::call_once( drainPoolOnceFlag_, []() {
+                ThreadPool::getInstance().emptyThreadPool();
+            } );
         }
         SignalHandler::getInstance()->setHTTPServer( nullptr );
     }
@@ -3809,10 +3813,13 @@ public:
                 pcfState_->doneCv.wait( lock, [this]() { return pcfState_->done.load(); } );
                 pcfState_ = nullptr;
             }
-            // Drain worker threads; emptyThreadPool() safely excludes and detaches
-            // the calling thread if stop() is invoked from a ThreadPool worker context.
-            ThreadPool::getInstance().emptyThreadPool();
         } );
+
+        if ( !ThreadPool::isCurrentThreadWorker() ) {
+            std::call_once( drainPoolOnceFlag_, []() {
+                ThreadPool::getInstance().emptyThreadPool();
+            } );
+        }
     }
 
     // Register Callbacks
@@ -4002,6 +4009,7 @@ protected:
     std::shared_ptr<PeriodicCounterFetcher::SharedState> pcfState_;
     std::atomic<bool> stopped_;
     std::once_flag stopOnceFlag_;
+    std::once_flag drainPoolOnceFlag_;
     double interval_;
     double coarseResolution_;
 };
